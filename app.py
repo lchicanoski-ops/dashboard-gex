@@ -86,6 +86,10 @@ def obter_dados_gex(ticker_symbol, taxa_juros=0.045, multiplicador_carrego=1.0):
     put_wall = df_gex.loc[df_gex['gex'].idxmin()]['strike']
     key_level = df_gex.loc[df_gex['gex'].abs().idxmax()]['strike']
     
+    # Limites da Estrutura de Gama
+    max_strike_gex = df_gex.loc[df_gex['strike'].idxmax()]['strike']
+    min_strike_gex = df_gex.loc[df_gex['strike'].idxmin()]['strike']
+
     # Cálculo do Gamma Flip próximo ao Spot
     df_gex = df_gex.sort_values('strike').reset_index(drop=True)
     df_gex['cumsum'] = df_gex['gex'].cumsum()
@@ -104,8 +108,8 @@ def obter_dados_gex(ticker_symbol, taxa_juros=0.045, multiplicador_carrego=1.0):
         'put_wall': put_wall,
         'key_level': key_level,
         'gamma_flip': gamma_flip,
-        'max_gamma': df_gex['strike'].max(),
-        'min_gamma': df_gex['strike'].min()
+        'max_gamma': max_strike_gex,
+        'min_gamma': min_strike_gex
     }
 
     return df_gex, metricas
@@ -130,6 +134,10 @@ def plotar_grafico_gex(df_gex, metricas, titulo):
     fig.add_hline(y=metricas['call_wall'], line_dash="dash", line_color="#ab47bc", annotation_text=f"Call Wall: {metricas['call_wall']:.2f}")
     fig.add_hline(y=metricas['put_wall'], line_dash="dash", line_color="#ff3b30", annotation_text=f"Put Wall: {metricas['put_wall']:.2f}")
     fig.add_hline(y=metricas['gamma_flip'], line_dash="dash", line_color="#00e5ff", annotation_text=f"Gamma Flip: {metricas['gamma_flip']:.2f}")
+    
+    # Adicionando limites do perfil
+    fig.add_hline(y=metricas['max_gamma'], line_dash="dot", line_color="#888888", annotation_text=f"Max Strike: {metricas['max_gamma']:.2f}")
+    fig.add_hline(y=metricas['min_gamma'], line_dash="dot", line_color="#888888", annotation_text=f"Min Strike: {metricas['min_gamma']:.2f}")
 
     fig.update_layout(
         title=f"{titulo} - Perfil de Gama por Strike",
@@ -167,6 +175,9 @@ if ativo == "EWZ (EUA / Brasil ETF)":
             st.metric("Put Wall", f"${metricas['put_wall']:.2f}")
             st.metric("Key Level", f"${metricas['key_level']:.2f}")
             st.metric("Gamma Flip", f"${metricas['gamma_flip']:.2f}")
+            st.markdown("---")
+            st.metric("Strike Máximo", f"${metricas['max_gamma']:.2f}")
+            st.metric("Strike Mínimo", f"${metricas['min_gamma']:.2f}")
     else:
         st.error("Erro ao carregar dados do EWZ.")
 
@@ -187,5 +198,8 @@ else:
             st.metric("Put Wall", f"{metricas['put_wall']:.0f} pts")
             st.metric("Key Level", f"{metricas['key_level']:.0f} pts")
             st.metric("Gamma Flip", f"{metricas['gamma_flip']:.0f} pts")
+            st.markdown("---")
+            st.metric("Strike Máximo", f"{metricas['max_gamma']:.0f} pts")
+            st.metric("Strike Mínimo", f"{metricas['min_gamma']:.0f} pts")
     else:
         st.error("Erro ao carregar dados do BOVA11.")
