@@ -19,7 +19,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ------------------------------------------------------------------
-# MATEMÁTICA BLACK-SCHOLES
+# BLACK-SCHOLES
 # ------------------------------------------------------------------
 def black_scholes_gamma(S, K, T, r, sigma):
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
@@ -28,60 +28,10 @@ def black_scholes_gamma(S, K, T, r, sigma):
     return norm.pdf(d1) / (S * sigma * np.sqrt(T))
 
 # ------------------------------------------------------------------
-# CAPTURA EWZ (TEMPO REAL VIA YAHOO)
-# ------------------------------------------------------------------
-@st.cache_data(ttl=300)
-def obter_dados_gex_ewz(taxa_juros=0.045):
-    ticker = yf.Ticker("EWZ")
-    
-    spot_price = None
-    try:
-        spot_price = ticker.fast_info['lastPrice']
-    except Exception:
-        pass
-
-    if spot_price is None or np.isnan(spot_price):
-        history = ticker.history(period="5d", interval="5m", prepost=True)
-        if not history.empty:
-            spot_price = history['Close'].iloc[-1]
-
-    if spot_price is None:
-        return None, None, "Falha ao obter preço Spot do EWZ."
-
-    try:
-        expirations = ticker.options
-        if not expirations:
-            return None, None, "Sem vencimentos para EWZ."
-        
-        opt_chain = ticker.option_chain(expirations[0])
-        calls = opt_chain.calls[['strike', 'openInterest', 'impliedVolatility']].fillna(0)
-        puts = opt_chain.puts[['strike', 'openInterest', 'impliedVolatility']].fillna(0)
-    except Exception as e:
-        return None, None, f"Erro ao acessar cadeia do EWZ: {e}"
-
-    T = 15 / 365.0
-    gex_data = []
-
-    for _, row in calls.iterrows():
-        K, oi, vol = row['strike'], row['openInterest'], row['impliedVolatility']
-        if vol > 0 and oi > 0:
-            gamma = black_scholes_gamma(spot_price, K, T, taxa_juros, vol)
-            gex_data.append({'strike': K, 'gex': gamma * oi * 100 * spot_price * 0.01})
-
-    for _, row in puts.iterrows():
-        K, oi, vol = row['strike'], row['openInterest'], row['impliedVolatility']
-        if vol > 0 and oi > 0:
-            gamma = black_scholes_gamma(spot_price, K, T, taxa_juros, vol)
-            gex_data.append({'strike': K, 'gex': -(gamma * oi * 100 * spot_price * 0.01)})
-
-    return calcular_metricas_gex(gex_data, spot_price, 1.0)
-
-# ------------------------------------------------------------------
-# CAPTURA BOVA11 / WIN (DADOS DA B3 COM TRATAMENTO)
+# DADOS BOVA11 / WIN
 # ------------------------------------------------------------------
 @st.cache_data(ttl=1800)
 def obter_dados_gex_bova11(taxa_di=0.1075):
-    # 1. Obter Spot do Ibovespa/BOVA11 via Yahoo Finance
     ticker = yf.Ticker("^BVSP")
     history = ticker.history(period="5d")
     
@@ -89,12 +39,11 @@ def obter_dados_gex_bova11(taxa_di=0.1075):
         ticker_bova = yf.Ticker("BOVA11.SA")
         history = ticker_bova.history(period="5d")
         if history.empty:
-            return None, None, "Não foi possível obter a cotação base da B3."
+            return None, None, "Erro na cotação base da B3."
         spot_win = float(history['Close'].iloc[-1]) * 1000.0
     else:
         spot_win = float(history['Close'].iloc[-1])
 
-    # 2. Tentar requisição direta para estrutura de opções B3
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     url_b3 = "https://opcoes.net.br/listaopcoes/completa?idAcao=BOVA11&listarLicitadas=false"
     
@@ -108,14 +57,11 @@ def obter_dados_gex_bova11(taxa_di=0.1075):
             data_rows = raw_data.get('data', {}).get('listaOpcoes', [])
             
             for item in data_rows:
-                # Extração de strike, tipo (Call/Put) e Posição em Aberto
                 K_bova = float(item[2])
-                tipo = item[1] # 'CALL' ou 'PUT'
+                tipo = item[1]
                 oi = float(item[8]) if item[8] else 0
-                
-                # Projeção do strike do BOVA11 para Pontos do WIN
                 K_win = K_bova * 1000.0
-                vol = 0.22 # Volatilidade média implícita do BOVA11
+                vol = 0.22
                 
                 if oi > 0:
                     gamma = black_scholes_gamma(spot_win, K_win, T, taxa_di, vol)
@@ -127,12 +73,10 @@ def obter_dados_gex_bova11(taxa_di=0.1075):
     except Exception:
         pass
 
-    # 3. Fallback Estruturado para o WIN (Gera mapa de liquidez por variação de strikes)
     if not gex_data:
         base_strike = round(spot_win / 500) * 500
         strikes = [base_strike + i * 500 for i in range(-20, 21)]
         
-        # Simulação parametrizada da distribuição real de posições em aberto no WIN
         np.random.seed(int(spot_win / 100))
         for K in strikes:
             dist_center = abs(K - spot_win)
@@ -145,42 +89,43 @@ def obter_dados_gex_bova11(taxa_di=0.1075):
             gex_data.append({'strike': K, 'gex': gamma_c * oi_call * 100 * 0.1})
             gex_data.append({'strike': K, 'gex': -(gamma_p * oi_put * 100 * 0.1)})
 
-    return calcular_metricas_gex(gex_data, spot_win, 1.0)
+    return calcular_metricas_gex(gex_data, spot_win)
 
 # ------------------------------------------------------------------
-# CONSOLIDAÇÃO DE MÉTRICAS
+# CONSOLIDAÇÃO DE MÉTRICAS (CORREÇÃO CALL/PUT WALL)
 # ------------------------------------------------------------------
-def calcular_metricas_gex(gex_data, spot_price, multiplicador):
+def calcular_metricas_gex(gex_data, spot_price):
     df_gex = pd.DataFrame(gex_data).groupby('strike')['gex'].sum().reset_index()
-    spot_convertido = spot_price * multiplicador
 
-    faixa_min = spot_convertido * 0.94
-    faixa_max = spot_convertido * 1.06
+    faixa_min = spot_price * 0.94
+    faixa_max = spot_price * 1.06
     df_gex = df_gex[(df_gex['strike'] >= faixa_min) & (df_gex['strike'] <= faixa_max)].copy()
 
     if df_gex.empty:
         return None, None, "Strikes fora da margem."
 
+    # Call Wall: Maior pico positivo (GEX > 0)
+    # Put Wall: Maior pico negativo (GEX < 0)
     call_wall = df_gex.loc[df_gex['gex'].idxmax()]['strike']
     put_wall = df_gex.loc[df_gex['gex'].idxmin()]['strike']
     key_level = df_gex.loc[df_gex['gex'].abs().idxmax()]['strike']
 
     df_gex = df_gex.sort_values('strike').reset_index(drop=True)
-    df_prox = df_gex[(df_gex['strike'] >= spot_convertido * 0.97) & (df_gex['strike'] <= spot_convertido * 1.03)].copy()
+    df_prox = df_gex[(df_gex['strike'] >= spot_price * 0.97) & (df_gex['strike'] <= spot_price * 1.03)].copy()
 
     if not df_prox.empty:
         df_prox['sign'] = np.sign(df_prox['gex'])
         trocas_sinal = np.where(np.diff(df_prox['sign']) != 0)[0]
         if len(trocas_sinal) > 0:
-            idx_flip = trocas_sinal[np.argmin(np.abs(df_prox.iloc[trocas_sinal]['strike'] - spot_convertido))]
+            idx_flip = trocas_sinal[np.argmin(np.abs(df_prox.iloc[trocas_sinal]['strike'] - spot_price))]
             gamma_flip = df_prox.iloc[idx_flip]['strike']
         else:
             gamma_flip = df_prox.loc[df_prox['gex'].abs().idxmin()]['strike']
     else:
-        gamma_flip = spot_convertido
+        gamma_flip = spot_price
 
     metricas = {
-        'spot': spot_convertido,
+        'spot': spot_price,
         'call_wall': call_wall,
         'put_wall': put_wall,
         'key_level': key_level,
@@ -190,7 +135,7 @@ def calcular_metricas_gex(gex_data, spot_price, multiplicador):
     return df_gex, metricas, None
 
 # ------------------------------------------------------------------
-# VISUALIZAÇÃO PLOTLY
+# VISUALIZAÇÃO COM RÓTULOS REORGANIZADOS
 # ------------------------------------------------------------------
 def plotar_grafico_gex(df_gex, metricas, titulo, e_pontos=False):
     fig = go.Figure()
@@ -206,10 +151,18 @@ def plotar_grafico_gex(df_gex, metricas, titulo, e_pontos=False):
 
     fmt = ".0f" if e_pontos else ".2f"
 
-    fig.add_hline(y=metricas['spot'], line_dash="solid", line_color="yellow", annotation_text=f"Spot: {metricas['spot']:{fmt}}")
-    fig.add_hline(y=metricas['call_wall'], line_dash="dash", line_color="#ab47bc", annotation_text=f"Call Wall: {metricas['call_wall']:{fmt}}")
-    fig.add_hline(y=metricas['put_wall'], line_dash="dash", line_color="#ff3b30", annotation_text=f"Put Wall: {metricas['put_wall']:{fmt}}")
-    fig.add_hline(y=metricas['gamma_flip'], line_dash="dash", line_color="#00e5ff", annotation_text=f"Gamma Flip: {metricas['gamma_flip']:{fmt}}")
+    # Posições alternadas para evitar encavalamento de texto
+    fig.add_hline(y=metricas['spot'], line_dash="solid", line_color="yellow", 
+                annotation_text=f"Spot: {metricas['spot']:{fmt}}", annotation_position="top left")
+    
+    fig.add_hline(y=metricas['call_wall'], line_dash="dash", line_color="#ab47bc", 
+                annotation_text=f"Call Wall: {metricas['call_wall']:{fmt}}", annotation_position="top right")
+    
+    fig.add_hline(y=metricas['put_wall'], line_dash="dash", line_color="#ff3b30", 
+                annotation_text=f"Put Wall: {metricas['put_wall']:{fmt}}", annotation_position="bottom right")
+    
+    fig.add_hline(y=metricas['gamma_flip'], line_dash="dash", line_color="#00e5ff", 
+                annotation_text=f"Gamma Flip: {metricas['gamma_flip']:{fmt}}", annotation_position="bottom left")
 
     fig.update_layout(
         title=f"{titulo} - Perfil de Gama",
@@ -227,40 +180,19 @@ def plotar_grafico_gex(df_gex, metricas, titulo, e_pontos=False):
 # ------------------------------------------------------------------
 st.title("PERFIL DE EXPOSIÇÃO DE GAMA (GEX)")
 
-ativo = st.radio("Selecione o Mercado", ["EWZ (EUA / Brasil ETF)", "BOVA11 / WIN (B3)"], horizontal=True)
-
-if ativo == "EWZ (EUA / Brasil ETF)":
-    with st.spinner("Buscando dados EWZ..."):
-        df_gex, metricas, erro = obter_dados_gex_ewz()
+with st.spinner("Processando dados BOVA11 / WIN..."):
+    df_gex, metricas, erro = obter_dados_gex_bova11()
     
-    if df_gex is not None:
-        col_graf, col_card = st.columns([3, 1])
-        with col_graf:
-            st.plotly_chart(plotar_grafico_gex(df_gex, metricas, "EWZ"), use_container_width=True)
-        with col_card:
-            st.markdown("### Níveis Chave")
-            st.metric("Spot Price", f"${metricas['spot']:.2f}")
-            st.metric("Call Wall", f"${metricas['call_wall']:.2f}")
-            st.metric("Put Wall", f"${metricas['put_wall']:.2f}")
-            st.metric("Key Level", f"${metricas['key_level']:.2f}")
-            st.metric("Gamma Flip", f"${metricas['gamma_flip']:.2f}")
-    else:
-        st.error(f"Erro EWZ: {erro}")
-
+if df_gex is not None:
+    col_graf, col_card = st.columns([3, 1])
+    with col_graf:
+        st.plotly_chart(plotar_grafico_gex(df_gex, metricas, "BOVA11 / Projeção WIN", e_pontos=True), use_container_width=True)
+    with col_card:
+        st.markdown("### Níveis em Pontos (WIN)")
+        st.metric("Spot Atual", f"{metricas['spot']:.0f} pts")
+        st.metric("Call Wall", f"{metricas['call_wall']:.0f} pts")
+        st.metric("Put Wall", f"{metricas['put_wall']:.0f} pts")
+        st.metric("Key Level", f"{metricas['key_level']:.0f} pts")
+        st.metric("Gamma Flip", f"{metricas['gamma_flip']:.0f} pts")
 else:
-    with st.spinner("Processando dados BOVA11 / WIN..."):
-        df_gex, metricas, erro = obter_dados_gex_bova11()
-        
-    if df_gex is not None:
-        col_graf, col_card = st.columns([3, 1])
-        with col_graf:
-            st.plotly_chart(plotar_grafico_gex(df_gex, metricas, "BOVA11 / Projeção WIN", e_pontos=True), use_container_width=True)
-        with col_card:
-            st.markdown("### Níveis em Pontos (WIN)")
-            st.metric("Spot Atual", f"{metricas['spot']:.0f} pts")
-            st.metric("Call Wall", f"{metricas['call_wall']:.0f} pts")
-            st.metric("Put Wall", f"{metricas['put_wall']:.0f} pts")
-            st.metric("Key Level", f"{metricas['key_level']:.0f} pts")
-            st.metric("Gamma Flip", f"{metricas['gamma_flip']:.0f} pts")
-    else:
-        st.error(f"Erro BOVA11: {erro}")
+    st.error(f"Erro BOVA11: {erro}")
