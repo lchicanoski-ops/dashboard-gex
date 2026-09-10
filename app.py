@@ -11,7 +11,10 @@ st.set_page_config(page_title="Perfil GEX - Gamma Exposure", layout="wide")
 st.markdown("""
     <style>
         .stApp { background-color: #0E1117; color: #FFFFFF; }
-        .block-container { padding-top: 1rem; padding-bottom: 1rem; }
+        .block-container { padding-top: 0.5rem; padding-bottom: 0.5rem; padding-left: 1rem; padding-right: 1rem; }
+        h1 { font-size: 1.2rem !important; margin-bottom: 0.2rem !important; }
+        h2, h3, h6 { font-size: 0.9rem !important; margin-bottom: 0.2rem !important; }
+        div[data-testid="stVerticalBlock"] > div { gap: 0.2rem; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -28,14 +31,23 @@ def black_scholes_gamma(S, K, T, r, sigma):
 @st.cache_data(ttl=300)
 def obter_dados_gex(ticker_symbol, taxa_juros=0.045, multiplicador_carrego=1.0):
     ticker = yf.Ticker(ticker_symbol)
-    history = ticker.history(period="5d")
     
-    if history.empty:
-        return None, None
+    # 1. Tenta capturar o preço Spot atualizado (com Pré-Mercado via fast_info)
+    spot_price = None
+    try:
+        spot_price = ticker.fast_info['lastPrice']
+    except Exception:
+        pass
+
+    if spot_price is None or np.isnan(spot_price):
+        history = ticker.history(period="5d", interval="5m", prepost=True)
+        if history.empty:
+            return None, None
+        spot_price = history['Close'].iloc[-1]
         
-    spot_price = history['Close'].iloc[-1] * multiplicador_carrego
+    spot_price = spot_price * multiplicador_carrego
+
     expirations = ticker.options
-    
     if not expirations:
         return None, None
     
@@ -73,9 +85,9 @@ def obter_dados_gex(ticker_symbol, taxa_juros=0.045, multiplicador_carrego=1.0):
 
     df_gex = pd.DataFrame(gex_data).groupby('strike')['gex'].sum().reset_index()
     
-    # Filtrar apenas strikes relevantes ao redor do Spot (evita distorção de pozinhos)
-    faixa_min = spot_price * 0.85
-    faixa_max = spot_price * 1.15
+    # Filtrar apenas strikes operacionais ao redor do Spot (88% a 112%)
+    faixa_min = spot_price * 0.88
+    faixa_max = spot_price * 1.12
     df_gex = df_gex[(df_gex['strike'] >= faixa_min) & (df_gex['strike'] <= faixa_max)].copy()
 
     if df_gex.empty:
@@ -85,20 +97,26 @@ def obter_dados_gex(ticker_symbol, taxa_juros=0.045, multiplicador_carrego=1.0):
     call_wall = df_gex.loc[df_gex['gex'].idxmax()]['strike']
     put_wall = df_gex.loc[df_gex['gex'].idxmin()]['strike']
     key_level = df_gex.loc[df_gex['gex'].abs().idxmax()]['strike']
-    
-    # Limites da Estrutura de Gama
-    max_strike_gex = df_gex.loc[df_gex['strike'].idxmax()]['strike']
-    min_strike_gex = df_gex.loc[df_gex['strike'].idxmin()]['strike']
 
-    # Cálculo do Gamma Flip próximo ao Spot
+    # ------------------------------------------------------------------
+    # CÁLCULO CORRIGIDO E CALIBRADO DO GAMMA FLIP (PERTO DO SPOT)
+    # ------------------------------------------------------------------
     df_gex = df_gex.sort_values('strike').reset_index(drop=True)
-    df_gex['cumsum'] = df_gex['gex'].cumsum()
     
-    zero_crossings = np.where(np.diff(np.sign(df_gex['cumsum'])))[0]
+    # Filtra vizinhança imediata (+-8% do Spot) para evitar distorção de pozinhos
+    df_prox = df_gex[(df_gex['strike'] >= spot_price * 0.92) & (df_gex['strike'] <= spot_price * 1.08)].copy()
     
-    if len(zero_crossings) > 0:
-        idx_prox = zero_crossings[np.argmin(np.abs(df_gex.loc[zero_crossings, 'strike'] - spot_price))]
-        gamma_flip = df_gex.iloc[idx_prox]['strike']
+    if not df_prox.empty:
+        df_prox['sign'] = np.sign(df_prox['gex'])
+        trocas_sinal = np.where(np.diff(df_prox['sign']) != 0)[0]
+        
+        if len(trocas_sinal) > 0:
+            # Pega o ponto de troca de sinal de gama mais próximo do Spot Price
+            idx_flip = trocas_sinal[np.argmin(np.abs(df_prox.iloc[trocas_sinal]['strike'] - spot_price))]
+            gamma_flip = df_prox.iloc[idx_flip]['strike']
+        else:
+            # Caso não haja inversão direta, pega o strike com exposição mais neutra perto do Spot
+            gamma_flip = df_prox.loc[df_prox['gex'].abs().idxmin()]['strike']
     else:
         gamma_flip = spot_price
 
@@ -107,9 +125,7 @@ def obter_dados_gex(ticker_symbol, taxa_juros=0.045, multiplicador_carrego=1.0):
         'call_wall': call_wall,
         'put_wall': put_wall,
         'key_level': key_level,
-        'gamma_flip': gamma_flip,
-        'max_gamma': max_strike_gex,
-        'min_gamma': min_strike_gex
+        'gamma_flip': gamma_flip
     }
 
     return df_gex, metricas
@@ -134,17 +150,13 @@ def plotar_grafico_gex(df_gex, metricas, titulo):
     fig.add_hline(y=metricas['call_wall'], line_dash="dash", line_color="#ab47bc", annotation_text=f"Call Wall: {metricas['call_wall']:.2f}")
     fig.add_hline(y=metricas['put_wall'], line_dash="dash", line_color="#ff3b30", annotation_text=f"Put Wall: {metricas['put_wall']:.2f}")
     fig.add_hline(y=metricas['gamma_flip'], line_dash="dash", line_color="#00e5ff", annotation_text=f"Gamma Flip: {metricas['gamma_flip']:.2f}")
-    
-    # Adicionando limites do perfil
-    fig.add_hline(y=metricas['max_gamma'], line_dash="dot", line_color="#888888", annotation_text=f"Max Strike: {metricas['max_gamma']:.2f}")
-    fig.add_hline(y=metricas['min_gamma'], line_dash="dot", line_color="#888888", annotation_text=f"Min Strike: {metricas['min_gamma']:.2f}")
 
     fig.update_layout(
         title=f"{titulo} - Perfil de Gama por Strike",
         template="plotly_dark",
         xaxis_title="Spot Gamma Exposure",
         yaxis_title="Strike",
-        height=680,
+        height=650,
         margin=dict(l=10, r=10, t=40, b=10)
     )
 
@@ -175,9 +187,6 @@ if ativo == "EWZ (EUA / Brasil ETF)":
             st.metric("Put Wall", f"${metricas['put_wall']:.2f}")
             st.metric("Key Level", f"${metricas['key_level']:.2f}")
             st.metric("Gamma Flip", f"${metricas['gamma_flip']:.2f}")
-            st.markdown("---")
-            st.metric("Strike Máximo", f"${metricas['max_gamma']:.2f}")
-            st.metric("Strike Mínimo", f"${metricas['min_gamma']:.2f}")
     else:
         st.error("Erro ao carregar dados do EWZ.")
 
@@ -198,8 +207,5 @@ else:
             st.metric("Put Wall", f"{metricas['put_wall']:.0f} pts")
             st.metric("Key Level", f"{metricas['key_level']:.0f} pts")
             st.metric("Gamma Flip", f"{metricas['gamma_flip']:.0f} pts")
-            st.markdown("---")
-            st.metric("Strike Máximo", f"{metricas['max_gamma']:.0f} pts")
-            st.metric("Strike Mínimo", f"{metricas['min_gamma']:.0f} pts")
     else:
         st.error("Erro ao carregar dados do BOVA11.")
