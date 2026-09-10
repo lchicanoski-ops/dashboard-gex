@@ -78,50 +78,65 @@ def obter_dados_gex_ewz(taxa_juros=0.045):
     return calcular_metricas_gex(gex_data, spot_price, 1.0)
 
 # ------------------------------------------------------------------
-# CAPTURA DE DADOS: BOVA11 / B3 VIA BRAPI (API PÚBLICA BRASILEIRA)
+# CAPTURA DE DADOS: BOVA11 / B3 VIA STATUSINVEST (REQUISITÇÃO DIRETA)
 # ------------------------------------------------------------------
 @st.cache_data(ttl=300)
 def obter_dados_gex_bova11(taxa_di=0.1075):
-    fator_win = 1000 * (1 + (taxa_di * (15 / 365)))
+    # Obter cotação real do BOVA11 via YFinance
+    ticker = yf.Ticker("BOVA11.SA")
+    history = ticker.history(period="5d")
     
-    # Endpoint de dados públicos em JSON para BOVA11
-    url = "https://brapi.dev/api/quote/BOVA11?modules=summaryProfile"
+    if history.empty:
+        return None, None, "Não foi possível obter a cotação do BOVA11."
+        
+    spot_price = float(history['Close'].iloc[-1])
+    
+    # Fator de conversão BOVA11 -> WIN em Pontos
+    # 1 cota de BOVA11 equivale aproximadamente a 1.000 pontos do Ibovespa (ajustado ao DI)
+    fator_win = 1000.0 * (1 + (taxa_di * (15 / 365)))
+
+    # Requisição para a API do StatusInvest (Dados do mercado B3)
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    
+    url = f"https://statusinvest.com.br/options/getoptionsgrid?code=BOVA11&currency=0"
     
     try:
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, headers=headers, timeout=10)
         data = response.json()
-        
-        if 'results' in data and len(data['results']) > 0:
-            spot_price = float(data['results'][0]['regularMarketPrice'])
-        else:
-            # Fallback seguro de preço via Yahoo Finance se a cotação falhar
-            ticker = yf.Ticker("BOVA11.SA")
-            history = ticker.history(period="2d")
-            spot_price = float(history['Close'].iloc[-1])
-
-        # Para contornar o bloqueio de IP no servidor do Streamlit,
-        # estimamos a malha de opções ativas de BOVA11 com base nos strikes principais
-        strikes = np.arange(round(spot_price * 0.85), round(spot_price * 1.15), 1.0)
         
         gex_data = []
         T = 15 / 365.0
 
-        for K in strikes:
-            # Estimativa de exposição baseada na concentração do Book Institucional B3
-            dist = abs(K - spot_price)
-            oi_call = max(100, int(50000 * np.exp(-dist * 0.3)))
-            oi_put = max(100, int(45000 * np.exp(-dist * 0.3)))
-            
-            gamma_c = black_scholes_gamma(spot_price, K, T, taxa_di, 0.22)
-            gamma_p = black_scholes_gamma(spot_price, K, T, taxa_di, 0.22)
-            
-            gex_data.append({'strike': K * fator_win, 'gex': gamma_c * oi_call * 100 * spot_price * 0.01})
-            gex_data.append({'strike': K * fator_win, 'gex': -(gamma_p * oi_put * 100 * spot_price * 0.01)})
+        if 'data' in data and len(data['data']) > 0:
+            for item in data['data']:
+                K = float(item.get('strike', 0))
+                if K <= 0:
+                    continue
+
+                # Posição em Aberto (Open Interest) Real das Calls e Puts
+                oi_call = float(item.get('callOpenInterest', 0) or 0)
+                oi_put = float(item.get('putOpenInterest', 0) or 0)
+                
+                vol_call = float(item.get('callImpliedVolatility', 0.20) or 0.20)
+                vol_put = float(item.get('putImpliedVolatility', 0.20) or 0.20)
+
+                if oi_call > 0:
+                    gamma_c = black_scholes_gamma(spot_price, K, T, taxa_di, vol_call)
+                    gex_data.append({'strike': K * fator_win, 'gex': gamma_c * oi_call * 100 * spot_price * 0.01})
+
+                if oi_put > 0:
+                    gamma_p = black_scholes_gamma(spot_price, K, T, taxa_di, vol_put)
+                    gex_data.append({'strike': K * fator_win, 'gex': -(gamma_p * oi_put * 100 * spot_price * 0.01)})
+
+        if not gex_data:
+            return None, None, "Sem liquidez/opções ativas retornadas para BOVA11."
 
         return calcular_metricas_gex(gex_data, spot_price, fator_win)
 
     except Exception as e:
-        return None, None, f"Erro na API B3: {e}"
+        return None, None, f"Erro ao conectar com API de opções B3: {e}"
 
 # ------------------------------------------------------------------
 # CONSOLIDAÇÃO DE MÉTRICAS E FLIP
@@ -133,8 +148,8 @@ def calcular_metricas_gex(gex_data, spot_price, multiplicador):
     df_gex = pd.DataFrame(gex_data).groupby('strike')['gex'].sum().reset_index()
     spot_convertido = spot_price * multiplicador
 
-    faixa_min = spot_convertido * 0.90
-    faixa_max = spot_convertido * 1.10
+    faixa_min = spot_convertido * 0.92
+    faixa_max = spot_convertido * 1.08
     df_gex = df_gex[(df_gex['strike'] >= faixa_min) & (df_gex['strike'] <= faixa_max)].copy()
 
     if df_gex.empty:
@@ -144,9 +159,9 @@ def calcular_metricas_gex(gex_data, spot_price, multiplicador):
     put_wall = df_gex.loc[df_gex['gex'].idxmin()]['strike']
     key_level = df_gex.loc[df_gex['gex'].abs().idxmax()]['strike']
 
-    # Gamma Flip Calibrado
+    # Gamma Flip Calibrado na Vizinhança
     df_gex = df_gex.sort_values('strike').reset_index(drop=True)
-    df_prox = df_gex[(df_gex['strike'] >= spot_convertido * 0.94) & (df_gex['strike'] <= spot_convertido * 1.06)].copy()
+    df_prox = df_gex[(df_gex['strike'] >= spot_convertido * 0.95) & (df_gex['strike'] <= spot_convertido * 1.05)].copy()
 
     if not df_prox.empty:
         df_prox['sign'] = np.sign(df_prox['gex'])
@@ -229,7 +244,7 @@ if ativo == "EWZ (EUA / Brasil ETF)":
         st.error(f"Erro EWZ: {erro}")
 
 else:
-    with st.spinner("Calculando Projeção B3 / WIN..."):
+    with st.spinner("Buscando matriz de opções reais do BOVA11..."):
         df_gex, metricas, erro = obter_dados_gex_bova11(taxa_di=0.1075)
         
     if df_gex is not None:
