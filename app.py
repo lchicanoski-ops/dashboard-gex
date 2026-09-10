@@ -17,9 +17,6 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# ------------------------------------------------------------------
-# CÁLCULO BLACK-SCHOLES
-# ------------------------------------------------------------------
 def black_scholes_gamma(S, K, T, r, sigma):
     if T <= 0 or sigma <= 0:
         return 0
@@ -28,10 +25,10 @@ def black_scholes_gamma(S, K, T, r, sigma):
     return gamma
 
 @st.cache_data(ttl=300)
-def obter_dados_gex(ticker_symbol, taxa_juros=0.1075, multiplicador_carrego=1.0, e_b3=False):
+def obter_dados_gex(ticker_symbol, taxa_juros=0.1075, multiplicador_carrego=1.0):
     ticker = yf.Ticker(ticker_symbol)
     
-    # 1. Pega preço atual do Spot
+    # 1. Pega Preço Spot
     spot_price = None
     try:
         spot_price = ticker.fast_info['lastPrice']
@@ -39,68 +36,92 @@ def obter_dados_gex(ticker_symbol, taxa_juros=0.1075, multiplicador_carrego=1.0,
         pass
 
     if spot_price is None or np.isnan(spot_price):
-        history = ticker.history(period="5d", interval="5m", prepost=True)
-        if history.empty:
-            return None, None
-        spot_price = history['Close'].iloc[-1]
+        try:
+            history = ticker.history(period="5d", interval="5m", prepost=True)
+            if not history.empty:
+                spot_price = history['Close'].iloc[-1]
+        except Exception:
+            pass
 
-    expirations = ticker.options
+    if spot_price is None or np.isnan(spot_price):
+        return None, None, "Não foi possível obter o preço atual do ativo."
+
+    try:
+        expirations = ticker.options
+    except Exception:
+        expirations = None
+
     if not expirations:
-        return None, None
+        return None, None, f"Sem datas de vencimento disponíveis para {ticker_symbol}."
     
-    exp_date = expirations[0] # Primeiro vencimento disponível
-    opt_chain = ticker.option_chain(exp_date)
+    calls, puts = pd.DataFrame(), pd.DataFrame()
     
-    calls = opt_chain.calls[['strike', 'openInterest', 'impliedVolatility']].dropna()
-    puts = opt_chain.puts[['strike', 'openInterest', 'impliedVolatility']].dropna()
-    
+    # Varre as datas de vencimento procurando por dados válidos
+    for exp_date in expirations[:4]:
+        try:
+            opt_chain = ticker.option_chain(exp_date)
+            if not opt_chain.calls.empty and not opt_chain.puts.empty:
+                c_df = opt_chain.calls[['strike', 'openInterest', 'volume', 'impliedVolatility']].copy()
+                p_df = opt_chain.puts[['strike', 'openInterest', 'volume', 'impliedVolatility']].copy()
+                
+                # Preenche valores nulos
+                c_df = c_df.fillna(0)
+                p_df = p_df.fillna(0)
+
+                # Verifica se há contratos ou volume
+                if (c_df['openInterest'].sum() + p_df['openInterest'].sum() > 0) or \
+                   (c_df['volume'].sum() + p_df['volume'].sum() > 0):
+                    calls = c_df
+                    puts = p_df
+                    break
+        except Exception:
+            continue
+            
+    if calls.empty or puts.empty:
+        return None, None, "Opções encontradas sem volume/posição aberta suficiente."
+
     T = 15 / 365.0
     gex_data = []
 
-    # Cálculo GEX das Calls
+    # Cálculo GEX Calls
     for _, row in calls.iterrows():
         K = row['strike']
-        oi = row['openInterest']
-        vol = row['impliedVolatility']
-        if vol > 0 and oi > 0:
+        oi = row['openInterest'] if row['openInterest'] > 0 else row['volume']
+        vol = row['impliedVolatility'] if row['impliedVolatility'] > 0 else 0.20
+        if oi > 0:
             gamma = black_scholes_gamma(spot_price, K, T, taxa_juros, vol)
             gex = gamma * oi * 100 * spot_price * 0.01
-            # Aplica o fator de escala/carrego aos strikes se for para projetar no WIN
             gex_data.append({'strike': K * multiplicador_carrego, 'gex': gex})
 
-    # Cálculo GEX das Puts
+    # Cálculo GEX Puts
     for _, row in puts.iterrows():
         K = row['strike']
-        oi = row['openInterest']
-        vol = row['impliedVolatility']
-        if vol > 0 and oi > 0:
+        oi = row['openInterest'] if row['openInterest'] > 0 else row['volume']
+        vol = row['impliedVolatility'] if row['impliedVolatility'] > 0 else 0.20
+        if oi > 0:
             gamma = black_scholes_gamma(spot_price, K, T, taxa_juros, vol)
             gex = -(gamma * oi * 100 * spot_price * 0.01)
             gex_data.append({'strike': K * multiplicador_carrego, 'gex': gex})
 
     if not gex_data:
-        return None, None
+        return None, None, "Falha no cálculo do GEX."
 
     df_gex = pd.DataFrame(gex_data).groupby('strike')['gex'].sum().reset_index()
     
     spot_convertido = spot_price * multiplicador_carrego
-
-    # Filtragem da faixa operacional em torno do preço
-    faixa_min = spot_convertido * 0.92
-    faixa_max = spot_convertido * 1.08
+    faixa_min = spot_convertido * 0.90
+    faixa_max = spot_convertido * 1.10
     df_gex = df_gex[(df_gex['strike'] >= faixa_min) & (df_gex['strike'] <= faixa_max)].copy()
 
     if df_gex.empty:
-        return None, None
+        return None, None, "Fora da faixa operacional."
 
-    # Níveis Chave
     call_wall = df_gex.loc[df_gex['gex'].idxmax()]['strike']
     put_wall = df_gex.loc[df_gex['gex'].idxmin()]['strike']
     key_level = df_gex.loc[df_gex['gex'].abs().idxmax()]['strike']
 
-    # Gamma Flip Calibrado
     df_gex = df_gex.sort_values('strike').reset_index(drop=True)
-    df_prox = df_gex[(df_gex['strike'] >= spot_convertido * 0.95) & (df_gex['strike'] <= spot_convertido * 1.05)].copy()
+    df_prox = df_gex[(df_gex['strike'] >= spot_convertido * 0.93) & (df_gex['strike'] <= spot_convertido * 1.07)].copy()
     
     if not df_prox.empty:
         df_prox['sign'] = np.sign(df_prox['gex'])
@@ -122,11 +143,8 @@ def obter_dados_gex(ticker_symbol, taxa_juros=0.1075, multiplicador_carrego=1.0,
         'gamma_flip': gamma_flip
     }
 
-    return df_gex, metricas
+    return df_gex, metricas, None
 
-# ------------------------------------------------------------------
-# DESENHO DO GRÁFICO SPOTGAMMA
-# ------------------------------------------------------------------
 def plotar_grafico_gex(df_gex, metricas, titulo, e_pontos=False):
     fig = go.Figure()
 
@@ -158,15 +176,15 @@ def plotar_grafico_gex(df_gex, metricas, titulo, e_pontos=False):
     return fig
 
 # ------------------------------------------------------------------
-# INTERFACE PRINCIPAL
+# INTERFACE
 # ------------------------------------------------------------------
 st.title("PERFIL DE EXPOSIÇÃO DE GAMA (GEX)")
 
 ativo = st.radio("Selecione o Mercado", ["EWZ (EUA / Brasil ETF)", "BOVA11 / WIN (B3)"], horizontal=True)
 
 if ativo == "EWZ (EUA / Brasil ETF)":
-    with st.spinner("Buscando dados de Opções EWZ..."):
-        df_gex, metricas = obter_dados_gex("EWZ", taxa_juros=0.045, multiplicador_carrego=1.0)
+    with st.spinner("Buscando dados de EWZ..."):
+        df_gex, metricas, erro = obter_dados_gex("EWZ", taxa_juros=0.045, multiplicador_carrego=1.0)
     
     if df_gex is not None:
         col_graf, col_card = st.columns([3, 1])
@@ -180,15 +198,13 @@ if ativo == "EWZ (EUA / Brasil ETF)":
             st.metric("Key Level", f"${metricas['key_level']:.2f}")
             st.metric("Gamma Flip", f"${metricas['gamma_flip']:.2f}")
     else:
-        st.error("Não foi possível carregar as opções de EWZ.")
+        st.error(f"Erro ao carregar EWZ: {erro}")
 
 else:
     with st.spinner("Buscando dados de BOVA11 e calculando projeção para o Mini Índice..."):
-        taxa_di = 0.1075  # Taxa de juros anualizada aproximada
-        # Converte o preço da cota do BOVA11 (~100x menor) projetado com taxa de carrego do contrato futuro
+        taxa_di = 0.1075
         fator_win = 1000 * (1 + (taxa_di * (15 / 365)))
-        
-        df_gex, metricas = obter_dados_gex("BOVA11.SA", taxa_juros=taxa_di, multiplicador_carrego=fator_win, e_b3=True)
+        df_gex, metricas, erro = obter_dados_gex("BOVA11.SA", taxa_juros=taxa_di, multiplicador_carrego=fator_win)
         
     if df_gex is not None:
         col_graf, col_card = st.columns([3, 1])
@@ -202,4 +218,4 @@ else:
             st.metric("Key Level", f"{metricas['key_level']:.0f} pts")
             st.metric("Gamma Flip", f"{metricas['gamma_flip']:.0f} pts")
     else:
-        st.warning("Opções de BOVA11 indisponíveis ou sem dados de Open Interest no momento.")
+        st.warning(f"Indisponível no momento: {erro}")
