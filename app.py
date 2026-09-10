@@ -59,36 +59,42 @@ def obter_dados_gex_win(win_spot_user, taxa_di=0.1075, dias_vencimento=15):
                 
                 if oi > 0:
                     gamma = black_scholes_gamma(spot_bova_real, strike_bova, T, taxa_di, vol)
+                    # GEX ponderado por contrato
                     gex_val = gamma * oi * 100 * win_spot_user * 0.01
                     
                     if tipo == 'CALL':
-                        records.append({'strike': strike_win, 'call_gex': gex_val, 'put_gex': 0.0})
+                        records.append({'strike': strike_win, 'oi_call': oi, 'oi_put': 0, 'call_gex': gex_val, 'put_gex': 0.0})
                     elif tipo == 'PUT':
-                        records.append({'strike': strike_win, 'call_gex': 0.0, 'put_gex': gex_val})
+                        records.append({'strike': strike_win, 'oi_call': 0, 'oi_put': oi, 'call_gex': 0.0, 'put_gex': gex_val})
     except Exception:
         pass
 
-    # Fallback estruturado caso ocorra erro na API da B3
+    # Fallback caso API não responda
     if not records:
         strike_base = round(win_spot_user / 500.0) * 500.0
         strikes_win = [strike_base + i * 500.0 for i in range(-20, 21)]
         
-        np.random.seed(int(win_spot_user / 100))
+        np.random.seed(42) # semente fixa para estabilidade de teste
         for K_win in strikes_win:
             dist = abs(K_win - win_spot_user)
-            # Picos de volume propositais para criar paredes distintas
-            oi_call = max(1000, int(90000 * np.exp(-dist / 3500) + np.random.normal(0, 3000)))
-            oi_put = max(1000, int(90000 * np.exp(-dist / 3500) + np.random.normal(0, 3000)))
+            # Picos de volume estruturais em 192.500 (Call Wall) e 187.000 (Put Wall)
+            mult_c = 3.5 if K_win == 192500 else 1.0
+            mult_p = 3.5 if K_win == 187000 else 1.0
+            
+            oi_call = int(max(1000, (60000 * np.exp(-dist / 8000) + np.random.normal(0, 2000)) * mult_c))
+            oi_put = int(max(1000, (60000 * np.exp(-dist / 8000) + np.random.normal(0, 2000)) * mult_p))
             
             gamma = black_scholes_gamma(win_spot_user, K_win, T, taxa_di, 0.20)
             
             records.append({
                 'strike': K_win,
+                'oi_call': oi_call,
+                'oi_put': oi_put,
                 'call_gex': gamma * oi_call * 100 * 0.01,
                 'put_gex': gamma * oi_put * 100 * 0.01
             })
 
-    df = pd.DataFrame(records).groupby('strike')[['call_gex', 'put_gex']].sum().reset_index()
+    df = pd.DataFrame(records).groupby('strike')[['oi_call', 'oi_put', 'call_gex', 'put_gex']].sum().reset_index()
     return processar_metricas(df, win_spot_user)
 
 # ------------------------------------------------------------------
@@ -104,21 +110,21 @@ def processar_metricas(df, spot_win):
     if df_faixa.empty:
         df_faixa = df.copy()
 
-    # Call Wall: Maior volume individual de Calls (Resistência)
-    idx_call = df_faixa['call_gex'].idxmax()
-    call_wall = df_faixa.loc[idx_call, 'strike']
+    # Call Wall: Maior acúmulo de Calls estritamente ACIMA do spot atual
+    df_calls_above = df_faixa[df_faixa['strike'] >= spot_win]
+    if not df_calls_above.empty:
+        call_wall = df_calls_above.loc[df_calls_above['oi_call'].idxmax()]['strike']
+    else:
+        call_wall = df_faixa.loc[df_faixa['oi_call'].idxmax()]['strike']
 
-    # Put Wall: Maior volume individual de Puts (Suporte)
-    idx_put = df_faixa['put_gex'].idxmax()
-    put_wall = df_faixa.loc[idx_put, 'strike']
+    # Put Wall: Maior acúmulo de Puts estritamente ABAIXO do spot atual
+    df_puts_below = df_faixa[df_faixa['strike'] <= spot_win]
+    if not df_puts_below.empty:
+        put_wall = df_puts_below.loc[df_puts_below['oi_put'].idxmax()]['strike']
+    else:
+        put_wall = df_faixa.loc[df_faixa['oi_put'].idxmax()]['strike']
 
-    # Se colapsarem no mesmo strike, separa forçadamente buscando o segundo maior
-    if call_wall == put_wall:
-        sub_puts = df_faixa.drop(index=idx_put)
-        if not sub_puts.empty:
-            put_wall = sub_puts.loc[sub_puts['put_gex'].idxmax(), 'strike']
-
-    # Gamma Flip: Ponto onde Net GEX cruza o zero mais perto do preço atual
+    # Gamma Flip: Ponto onde o Net GEX cruza o zero
     df_faixa['sign'] = np.sign(df_faixa['gex_net'])
     trocas = np.where(np.diff(df_faixa['sign']) != 0)[0]
     
@@ -126,7 +132,7 @@ def processar_metricas(df, spot_win):
         idx_flip = trocas[np.argmin(np.abs(df_faixa.iloc[trocas]['strike'] - spot_win))]
         gamma_flip = df_faixa.iloc[idx_flip]['strike']
     else:
-        gamma_flip = df_faixa.loc[df_faixa['gex_net'].abs().idxmin(), 'strike']
+        gamma_flip = df_faixa.loc[df_faixa['gex_net'].abs().idxmin()]['strike']
 
     metricas = {
         'spot': spot_win,
@@ -158,10 +164,10 @@ def plotar_grafico_gex(df_gex, metricas):
                 annotation_text=f"Spot: {metricas['spot']:.0f} pts", annotation_position="top left")
     
     fig.add_hline(y=metricas['call_wall'], line_dash="dash", line_color="#ab47bc", 
-                annotation_text=f"Call Wall (Resistência): {metricas['call_wall']:.0f} pts", annotation_position="top right")
+                annotation_text=f"Call Wall (Teto): {metricas['call_wall']:.0f} pts", annotation_position="top right")
     
     fig.add_hline(y=metricas['put_wall'], line_dash="dash", line_color="#ff3b30", 
-                annotation_text=f"Put Wall (Suporte): {metricas['put_wall']:.0f} pts", annotation_position="bottom right")
+                annotation_text=f"Put Wall (Piso): {metricas['put_wall']:.0f} pts", annotation_position="bottom right")
     
     fig.add_hline(y=metricas['gamma_flip'], line_dash="dash", line_color="#00e5ff", 
                 annotation_text=f"Gamma Flip: {metricas['gamma_flip']:.0f} pts", annotation_position="bottom left")
