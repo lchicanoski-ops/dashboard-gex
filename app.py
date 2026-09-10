@@ -4,7 +4,6 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from scipy.stats import norm
-import requests
 
 st.set_page_config(page_title="Perfil GEX - B3 & EWZ", layout="wide")
 
@@ -29,7 +28,7 @@ def black_scholes_gamma(S, K, T, r, sigma):
     return gamma
 
 # ------------------------------------------------------------------
-# CAPTURA DE DADOS: EWZ (YAHOO FINANCE)
+# CAPTURA DE DADOS: EWZ (TEMPO REAL - YAHOO FINANCE)
 # ------------------------------------------------------------------
 @st.cache_data(ttl=300)
 def obter_dados_gex_ewz(taxa_juros=0.045):
@@ -69,9 +68,6 @@ def obter_dados_gex_ewz(taxa_juros=0.045):
             gamma = black_scholes_gamma(spot_price, K, T, taxa_juros, vol)
             gex_data.append({'strike': K, 'gex': gamma * oi * 100 * spot_price * 0.01})
 
-    for _, row in calls.iterrows():
-        pass
-
     for _, row in puts.iterrows():
         K, oi, vol = row['strike'], row['openInterest'], row['impliedVolatility']
         if vol > 0 and oi > 0:
@@ -81,76 +77,57 @@ def obter_dados_gex_ewz(taxa_juros=0.045):
     return calcular_metricas_gex(gex_data, spot_price, 1.0)
 
 # ------------------------------------------------------------------
-# CAPTURA DE DADOS: BOVA11 / WIN VIA CONEXÃO DIRETA B3
+# CAPTURA DE DADOS: BOVA11 / WIN (D-1 FECHAMENTO OFICIAL B3)
 # ------------------------------------------------------------------
-@st.cache_data(ttl=300)
-def obter_dados_gex_bova11(taxa_di=0.1075):
-    # Obter cotação atual do BOVA11
+@st.cache_data(ttl=3600)  # Cache longo de 1 hora já que os dados são de D-1
+def obter_dados_gex_bova11_d1(taxa_di=0.1075):
     ticker = yf.Ticker("BOVA11.SA")
     history = ticker.history(period="5d")
     
-    if history.empty:
-        return None, None, "Não foi possível obter a cotação do BOVA11."
+    if len(history) < 2:
+        return None, None, "Histórico insuficiente para BOVA11."
         
-    spot_price = float(history['Close'].iloc[-1])
-    
-    # Projeção fiel para o contrato futuro WIN (Ajustado pela taxa Selic/DI do período)
+    # Preço de Fechamento de D-1
+    spot_bova_fechamento = float(history['Close'].iloc[-2])
+    # Preço Spot Atual/Último para referência
+    spot_bova_atual = float(history['Close'].iloc[-1])
+
+    # Fator de conversão BOVA11 -> Pontos do WIN
+    # Projeção de juros e conversão de cota
     fator_win = 1000.0 * (1 + (taxa_di * (15 / 365)))
     
-    # Tentativa de captura via API pública do Yahoo com Headers rotativos para evitar 403
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
-    })
-    
-    gex_data = []
     T = 15 / 365.0
-    
+    gex_data = []
+
     try:
-        # Tenta buscar diretamente a cadeia de opções caso o YFinance local responda
         expirations = ticker.options
         if expirations and len(expirations) > 0:
             opt_chain = ticker.option_chain(expirations[0])
             calls = opt_chain.calls[['strike', 'openInterest', 'impliedVolatility']].fillna(0)
             puts = opt_chain.puts[['strike', 'openInterest', 'impliedVolatility']].fillna(0)
-            
+
             for _, row in calls.iterrows():
                 K, oi, vol = row['strike'], row['openInterest'], row['impliedVolatility']
-                vol = vol if vol > 0 else 0.20
+                vol = vol if vol > 0 else 0.22
                 if oi > 0:
-                    gamma = black_scholes_gamma(spot_price, K, T, taxa_di, vol)
-                    gex_data.append({'strike': K * fator_win, 'gex': gamma * oi * 100 * spot_price * 0.01})
+                    gamma = black_scholes_gamma(spot_bova_fechamento, K, T, taxa_di, vol)
+                    # GEX Positivo para Calls
+                    gex_data.append({'strike': K * fator_win, 'gex': gamma * oi * 100 * spot_bova_fechamento * 0.01})
 
             for _, row in puts.iterrows():
                 K, oi, vol = row['strike'], row['openInterest'], row['impliedVolatility']
-                vol = vol if vol > 0 else 0.20
+                vol = vol if vol > 0 else 0.22
                 if oi > 0:
-                    gamma = black_scholes_gamma(spot_price, K, T, taxa_di, vol)
-                    gex_data.append({'strike': K * fator_win, 'gex': -(gamma * oi * 100 * spot_price * 0.01)})
+                    gamma = black_scholes_gamma(spot_bova_fechamento, K, T, taxa_di, vol)
+                    # GEX Negativo para Puts
+                    gex_data.append({'strike': K * fator_win, 'gex': -(gamma * oi * 100 * spot_bova_fechamento * 0.01)})
+    except Exception as e:
+        return None, None, f"Erro ao processar dados D-1 do BOVA11: {e}"
 
-    except Exception:
-        pass
-
-    # Caso o YFinance sofra bloqueio ou não retorne a cadeia da B3 no horário
     if not gex_data:
-        strikes_bova = np.arange(np.floor(spot_price * 0.88), np.ceil(spot_price * 1.12), 1.0)
-        np.random.seed(int(spot_price))
-        
-        for K in strikes_bova:
-            dist = abs(K - spot_price)
-            # Simulação do perfil assimétrico real de opções na B3 (mais Puts fora do dinheiro)
-            oi_call = int(max(500, 80000 * np.exp(-dist * 0.25)))
-            oi_put = int(max(500, 95000 * np.exp(-dist * 0.20)))
-            
-            vol = 0.20 + (dist / spot_price) * 0.1
-            
-            gamma_c = black_scholes_gamma(spot_price, K, T, taxa_di, vol)
-            gamma_p = black_scholes_gamma(spot_price, K, T, taxa_di, vol)
-            
-            gex_data.append({'strike': K * fator_win, 'gex': gamma_c * oi_call * 100 * spot_price * 0.01})
-            gex_data.append({'strike': K * fator_win, 'gex': -(gamma_p * oi_put * 100 * spot_price * 0.01)})
+        return None, None, "Cadeia de opções D-1 vazia ou indisponível."
 
-    return calcular_metricas_gex(gex_data, spot_price, fator_win)
+    return calcular_metricas_gex(gex_data, spot_bova_atual, fator_win)
 
 # ------------------------------------------------------------------
 # CONSOLIDAÇÃO DE MÉTRICAS E FLIP
@@ -162,8 +139,9 @@ def calcular_metricas_gex(gex_data, spot_price, multiplicador):
     df_gex = pd.DataFrame(gex_data).groupby('strike')['gex'].sum().reset_index()
     spot_convertido = spot_price * multiplicador
 
-    faixa_min = spot_convertido * 0.90
-    faixa_max = spot_convertido * 1.10
+    # Margem operacional de +/- 8% em torno do preço atual
+    faixa_min = spot_convertido * 0.92
+    faixa_max = spot_convertido * 1.08
     df_gex = df_gex[(df_gex['strike'] >= faixa_min) & (df_gex['strike'] <= faixa_max)].copy()
 
     if df_gex.empty:
@@ -173,9 +151,8 @@ def calcular_metricas_gex(gex_data, spot_price, multiplicador):
     put_wall = df_gex.loc[df_gex['gex'].idxmin()]['strike']
     key_level = df_gex.loc[df_gex['gex'].abs().idxmax()]['strike']
 
-    # Gamma Flip Calibrado
     df_gex = df_gex.sort_values('strike').reset_index(drop=True)
-    df_prox = df_gex[(df_gex['strike'] >= spot_convertido * 0.95) & (df_gex['strike'] <= spot_convertido * 1.05)].copy()
+    df_prox = df_gex[(df_gex['strike'] >= spot_convertido * 0.96) & (df_gex['strike'] <= spot_convertido * 1.04)].copy()
 
     if not df_prox.empty:
         df_prox['sign'] = np.sign(df_prox['gex'])
@@ -205,6 +182,7 @@ def calcular_metricas_gex(gex_data, spot_price, multiplicador):
 def plotar_grafico_gex(df_gex, metricas, titulo, e_pontos=False):
     fig = go.Figure()
 
+    # Verde para GEX Positivo (Calls/Suporte de Volatilidade), Vermelho para GEX Negativo (Puts/Aceleração)
     cores = ['#1b8a2e' if v >= 0 else '#ff3b30' for v in df_gex['gex']]
     fig.add_trace(go.Bar(
         y=df_gex['strike'],
@@ -237,10 +215,10 @@ def plotar_grafico_gex(df_gex, metricas, titulo, e_pontos=False):
 # ------------------------------------------------------------------
 st.title("PERFIL DE EXPOSIÇÃO DE GAMA (GEX)")
 
-ativo = st.radio("Selecione o Mercado", ["EWZ (EUA / Brasil ETF)", "BOVA11 / WIN (B3)"], horizontal=True)
+ativo = st.radio("Selecione o Mercado", ["EWZ (EUA / Brasil ETF)", "BOVA11 / WIN (B3 Fechamento D-1)"], horizontal=True)
 
 if ativo == "EWZ (EUA / Brasil ETF)":
-    with st.spinner("Buscando dados de EWZ..."):
+    with st.spinner("Buscando dados em tempo real do EWZ..."):
         df_gex, metricas, erro = obter_dados_gex_ewz(taxa_juros=0.045)
     
     if df_gex is not None:
@@ -258,19 +236,19 @@ if ativo == "EWZ (EUA / Brasil ETF)":
         st.error(f"Erro EWZ: {erro}")
 
 else:
-    with st.spinner("Calculando Exposição de Gama BOVA11 / WIN..."):
-        df_gex, metricas, erro = obter_dados_gex_bova11(taxa_di=0.1075)
+    with st.spinner("Carregando Posição de Fechamento D-1 (B3)..."):
+        df_gex, metricas, erro = obter_dados_gex_bova11_d1(taxa_di=0.1075)
         
     if df_gex is not None:
         col_graf, col_card = st.columns([3, 1])
         with col_graf:
-            st.plotly_chart(plotar_grafico_gex(df_gex, metricas, "BOVA11 / Projeção WIN", e_pontos=True), use_container_width=True)
+            st.plotly_chart(plotar_grafico_gex(df_gex, metricas, "BOVA11 / Projeção WIN (Fechamento B3)", e_pontos=True), use_container_width=True)
         with col_card:
             st.markdown("### Níveis em Pontos (WIN)")
-            st.metric("Spot Projetado", f"{metricas['spot']:.0f} pts")
+            st.metric("Spot Atual", f"{metricas['spot']:.0f} pts")
             st.metric("Call Wall", f"{metricas['call_wall']:.0f} pts")
             st.metric("Put Wall", f"{metricas['put_wall']:.0f} pts")
             st.metric("Key Level", f"{metricas['key_level']:.0f} pts")
             st.metric("Gamma Flip", f"{metricas['gamma_flip']:.0f} pts")
     else:
-        st.warning(f"Indisponível: {erro}")
+        st.error(f"Erro BOVA11: {erro}")
