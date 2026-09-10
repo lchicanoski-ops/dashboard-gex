@@ -5,9 +5,8 @@ import numpy as np
 import plotly.graph_objects as go
 from scipy.stats import norm
 
-st.set_page_config(page_title="Perfil GEX - Gamma Exposure", layout="wide")
+st.set_page_config(page_title="Perfil GEX - B3 & EWZ", layout="wide")
 
-# CSS para estilo escuro e denso
 st.markdown("""
     <style>
         .stApp { background-color: #0E1117; color: #FFFFFF; }
@@ -19,7 +18,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ------------------------------------------------------------------
-# MOTOR DE CÁLCULO GEX (BLACK-SCHOLES)
+# CÁLCULO BLACK-SCHOLES
 # ------------------------------------------------------------------
 def black_scholes_gamma(S, K, T, r, sigma):
     if T <= 0 or sigma <= 0:
@@ -29,10 +28,10 @@ def black_scholes_gamma(S, K, T, r, sigma):
     return gamma
 
 @st.cache_data(ttl=300)
-def obter_dados_gex(ticker_symbol, taxa_juros=0.045, multiplicador_carrego=1.0):
+def obter_dados_gex(ticker_symbol, taxa_juros=0.1075, multiplicador_carrego=1.0, e_b3=False):
     ticker = yf.Ticker(ticker_symbol)
     
-    # 1. Tenta capturar o preço Spot atualizado (com Pré-Mercado via fast_info)
+    # 1. Pega preço atual do Spot
     spot_price = None
     try:
         spot_price = ticker.fast_info['lastPrice']
@@ -44,14 +43,12 @@ def obter_dados_gex(ticker_symbol, taxa_juros=0.045, multiplicador_carrego=1.0):
         if history.empty:
             return None, None
         spot_price = history['Close'].iloc[-1]
-        
-    spot_price = spot_price * multiplicador_carrego
 
     expirations = ticker.options
     if not expirations:
         return None, None
     
-    exp_date = expirations[0]  # Primeiro vencimento (curto prazo)
+    exp_date = expirations[0] # Primeiro vencimento disponível
     opt_chain = ticker.option_chain(exp_date)
     
     calls = opt_chain.calls[['strike', 'openInterest', 'impliedVolatility']].dropna()
@@ -60,34 +57,37 @@ def obter_dados_gex(ticker_symbol, taxa_juros=0.045, multiplicador_carrego=1.0):
     T = 15 / 365.0
     gex_data = []
 
-    # Calls (Gama Positivo)
+    # Cálculo GEX das Calls
     for _, row in calls.iterrows():
-        K = row['strike'] * multiplicador_carrego
+        K = row['strike']
         oi = row['openInterest']
         vol = row['impliedVolatility']
         if vol > 0 and oi > 0:
             gamma = black_scholes_gamma(spot_price, K, T, taxa_juros, vol)
             gex = gamma * oi * 100 * spot_price * 0.01
-            gex_data.append({'strike': K, 'gex': gex})
+            # Aplica o fator de escala/carrego aos strikes se for para projetar no WIN
+            gex_data.append({'strike': K * multiplicador_carrego, 'gex': gex})
 
-    # Puts (Gama Negativo)
+    # Cálculo GEX das Puts
     for _, row in puts.iterrows():
-        K = row['strike'] * multiplicador_carrego
+        K = row['strike']
         oi = row['openInterest']
         vol = row['impliedVolatility']
         if vol > 0 and oi > 0:
             gamma = black_scholes_gamma(spot_price, K, T, taxa_juros, vol)
             gex = -(gamma * oi * 100 * spot_price * 0.01)
-            gex_data.append({'strike': K, 'gex': gex})
+            gex_data.append({'strike': K * multiplicador_carrego, 'gex': gex})
 
     if not gex_data:
         return None, None
 
     df_gex = pd.DataFrame(gex_data).groupby('strike')['gex'].sum().reset_index()
     
-    # Filtrar apenas strikes operacionais ao redor do Spot (88% a 112%)
-    faixa_min = spot_price * 0.88
-    faixa_max = spot_price * 1.12
+    spot_convertido = spot_price * multiplicador_carrego
+
+    # Filtragem da faixa operacional em torno do preço
+    faixa_min = spot_convertido * 0.92
+    faixa_max = spot_convertido * 1.08
     df_gex = df_gex[(df_gex['strike'] >= faixa_min) & (df_gex['strike'] <= faixa_max)].copy()
 
     if df_gex.empty:
@@ -98,30 +98,24 @@ def obter_dados_gex(ticker_symbol, taxa_juros=0.045, multiplicador_carrego=1.0):
     put_wall = df_gex.loc[df_gex['gex'].idxmin()]['strike']
     key_level = df_gex.loc[df_gex['gex'].abs().idxmax()]['strike']
 
-    # ------------------------------------------------------------------
-    # CÁLCULO CORRIGIDO E CALIBRADO DO GAMMA FLIP (PERTO DO SPOT)
-    # ------------------------------------------------------------------
+    # Gamma Flip Calibrado
     df_gex = df_gex.sort_values('strike').reset_index(drop=True)
-    
-    # Filtra vizinhança imediata (+-8% do Spot) para evitar distorção de pozinhos
-    df_prox = df_gex[(df_gex['strike'] >= spot_price * 0.92) & (df_gex['strike'] <= spot_price * 1.08)].copy()
+    df_prox = df_gex[(df_gex['strike'] >= spot_convertido * 0.95) & (df_gex['strike'] <= spot_convertido * 1.05)].copy()
     
     if not df_prox.empty:
         df_prox['sign'] = np.sign(df_prox['gex'])
         trocas_sinal = np.where(np.diff(df_prox['sign']) != 0)[0]
         
         if len(trocas_sinal) > 0:
-            # Pega o ponto de troca de sinal de gama mais próximo do Spot Price
-            idx_flip = trocas_sinal[np.argmin(np.abs(df_prox.iloc[trocas_sinal]['strike'] - spot_price))]
+            idx_flip = trocas_sinal[np.argmin(np.abs(df_prox.iloc[trocas_sinal]['strike'] - spot_convertido))]
             gamma_flip = df_prox.iloc[idx_flip]['strike']
         else:
-            # Caso não haja inversão direta, pega o strike com exposição mais neutra perto do Spot
             gamma_flip = df_prox.loc[df_prox['gex'].abs().idxmin()]['strike']
     else:
-        gamma_flip = spot_price
+        gamma_flip = spot_convertido
 
     metricas = {
-        'spot': spot_price,
+        'spot': spot_convertido,
         'call_wall': call_wall,
         'put_wall': put_wall,
         'key_level': key_level,
@@ -133,7 +127,7 @@ def obter_dados_gex(ticker_symbol, taxa_juros=0.045, multiplicador_carrego=1.0):
 # ------------------------------------------------------------------
 # DESENHO DO GRÁFICO SPOTGAMMA
 # ------------------------------------------------------------------
-def plotar_grafico_gex(df_gex, metricas, titulo):
+def plotar_grafico_gex(df_gex, metricas, titulo, e_pontos=False):
     fig = go.Figure()
 
     cores = ['#1b8a2e' if v >= 0 else '#ff3b30' for v in df_gex['gex']]
@@ -145,17 +139,18 @@ def plotar_grafico_gex(df_gex, metricas, titulo):
         name="Gamma Exposure"
     ))
 
-    # Adicionando Linhas dos Níveis Chave
-    fig.add_hline(y=metricas['spot'], line_dash="solid", line_color="yellow", annotation_text=f"Spot Price: {metricas['spot']:.2f}")
-    fig.add_hline(y=metricas['call_wall'], line_dash="dash", line_color="#ab47bc", annotation_text=f"Call Wall: {metricas['call_wall']:.2f}")
-    fig.add_hline(y=metricas['put_wall'], line_dash="dash", line_color="#ff3b30", annotation_text=f"Put Wall: {metricas['put_wall']:.2f}")
-    fig.add_hline(y=metricas['gamma_flip'], line_dash="dash", line_color="#00e5ff", annotation_text=f"Gamma Flip: {metricas['gamma_flip']:.2f}")
+    fmt = ".0f" if e_pontos else ".2f"
+
+    fig.add_hline(y=metricas['spot'], line_dash="solid", line_color="yellow", annotation_text=f"Spot: {metricas['spot']:{fmt}}")
+    fig.add_hline(y=metricas['call_wall'], line_dash="dash", line_color="#ab47bc", annotation_text=f"Call Wall: {metricas['call_wall']:{fmt}}")
+    fig.add_hline(y=metricas['put_wall'], line_dash="dash", line_color="#ff3b30", annotation_text=f"Put Wall: {metricas['put_wall']:{fmt}}")
+    fig.add_hline(y=metricas['gamma_flip'], line_dash="dash", line_color="#00e5ff", annotation_text=f"Gamma Flip: {metricas['gamma_flip']:{fmt}}")
 
     fig.update_layout(
-        title=f"{titulo} - Perfil de Gama por Strike",
+        title=f"{titulo} - Perfil de Gama",
         template="plotly_dark",
-        xaxis_title="Spot Gamma Exposure",
-        yaxis_title="Strike",
+        xaxis_title="Gamma Exposure (GEX)",
+        yaxis_title="Strike / Pontos",
         height=650,
         margin=dict(l=10, r=10, t=40, b=10)
     )
@@ -167,13 +162,10 @@ def plotar_grafico_gex(df_gex, metricas, titulo):
 # ------------------------------------------------------------------
 st.title("PERFIL DE EXPOSIÇÃO DE GAMA (GEX)")
 
-col_sel, col_info = st.columns([1, 3])
-
-with col_sel:
-    ativo = st.radio("Selecione o Mercado", ["EWZ (EUA / Brasil ETF)", "WIN / BOVA11 (B3)"])
+ativo = st.radio("Selecione o Mercado", ["EWZ (EUA / Brasil ETF)", "BOVA11 / WIN (B3)"], horizontal=True)
 
 if ativo == "EWZ (EUA / Brasil ETF)":
-    with st.spinner("Buscando cadeia de opções do EWZ..."):
+    with st.spinner("Buscando dados de Opções EWZ..."):
         df_gex, metricas = obter_dados_gex("EWZ", taxa_juros=0.045, multiplicador_carrego=1.0)
     
     if df_gex is not None:
@@ -188,24 +180,26 @@ if ativo == "EWZ (EUA / Brasil ETF)":
             st.metric("Key Level", f"${metricas['key_level']:.2f}")
             st.metric("Gamma Flip", f"${metricas['gamma_flip']:.2f}")
     else:
-        st.error("Erro ao carregar dados do EWZ.")
+        st.error("Não foi possível carregar as opções de EWZ.")
 
 else:
-    with st.spinner("Buscando dados de BOVA11 e calculando carrego..."):
-        taxa_di = 0.1075  # Taxa DI/Selic
-        fator_win = 1000 * (1 + (taxa_di * (15 / 365)))  # Fator de conversão do contrato
-        df_gex, metricas = obter_dados_gex("BOVA11.SA", taxa_juros=taxa_di, multiplicador_carrego=fator_win)
+    with st.spinner("Buscando dados de BOVA11 e calculando projeção para o Mini Índice..."):
+        taxa_di = 0.1075  # Taxa de juros anualizada aproximada
+        # Converte o preço da cota do BOVA11 (~100x menor) projetado com taxa de carrego do contrato futuro
+        fator_win = 1000 * (1 + (taxa_di * (15 / 365)))
+        
+        df_gex, metricas = obter_dados_gex("BOVA11.SA", taxa_juros=taxa_di, multiplicador_carrego=fator_win, e_b3=True)
         
     if df_gex is not None:
         col_graf, col_card = st.columns([3, 1])
         with col_graf:
-            st.plotly_chart(plotar_grafico_gex(df_gex, metricas, "WIN / BOVA11"), use_container_width=True)
+            st.plotly_chart(plotar_grafico_gex(df_gex, metricas, "BOVA11 / Projeção WIN", e_pontos=True), use_container_width=True)
         with col_card:
-            st.markdown("### Níveis Chave")
-            st.metric("Spot Convertido", f"{metricas['spot']:.0f} pts")
+            st.markdown("### Níveis em Pontos (WIN)")
+            st.metric("Spot Projetado", f"{metricas['spot']:.0f} pts")
             st.metric("Call Wall", f"{metricas['call_wall']:.0f} pts")
             st.metric("Put Wall", f"{metricas['put_wall']:.0f} pts")
             st.metric("Key Level", f"{metricas['key_level']:.0f} pts")
             st.metric("Gamma Flip", f"{metricas['gamma_flip']:.0f} pts")
     else:
-        st.error("Erro ao carregar dados do BOVA11.")
+        st.warning("Opções de BOVA11 indisponíveis ou sem dados de Open Interest no momento.")
