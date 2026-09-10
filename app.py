@@ -6,13 +6,15 @@ import plotly.graph_objects as go
 import requests
 from scipy.stats import norm
 
-st.set_page_config(page_title="Perfil GEX B3", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Perfil GEX B3 / EWZ", layout="wide", initial_sidebar_state="collapsed")
 
+# CSS para ocultar a barra lateral e estilizar os botoes radio no topo
 st.markdown("""
     <style>
         [data-testid="stSidebar"] { display: none; }
         .block-container { padding-top: 0.8rem; padding-bottom: 0.5rem; padding-left: 1.5rem; padding-right: 1.5rem; }
         h1 { font-size: 1.2rem !important; margin-bottom: 0.2rem !important; }
+        div.row-widget.stRadio > div { flex-direction: row; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -33,12 +35,11 @@ def obter_dados_gex_auto(ativo_selecionado, taxa_di=0.1075, dias_vencimento=15):
     records = []
     T = dias_vencimento / 365.0
 
-    if ativo_selecionado == "WIN (Mini Índice)":
+    if "BOVA11" in ativo_selecionado:
         ticker_bova = yf.Ticker("BOVA11.SA")
         hist_bova = ticker_bova.history(period="5d")
         spot_bova = float(hist_bova['Close'].iloc[-1]) if not hist_bova.empty else 115.0
         
-        # Estima cotação do WIN com base no BOVA11
         spot_real = round(spot_bova * 1000.0 / 500.0) * 500.0
         
         headers = {'User-Agent': 'Mozilla/5.0'}
@@ -72,9 +73,9 @@ def obter_dados_gex_auto(ativo_selecionado, taxa_di=0.1075, dias_vencimento=15):
         hist_ewz = ticker_ewz.history(period="5d")
         spot_real = float(hist_ewz['Close'].iloc[-1]) if not hist_ewz.empty else 28.50
 
-    # Fallback estruturado automático com base no preço real capturado
+    # Fallback estruturado
     if not records:
-        step = 500.0 if "WIN" in ativo_selecionado else 0.5
+        step = 500.0 if "BOVA11" in ativo_selecionado else 0.5
         strike_base = round(spot_real / step) * step
         strikes = [strike_base + i * step for i in range(-15, 16)]
         
@@ -101,20 +102,17 @@ def obter_dados_gex_auto(ativo_selecionado, taxa_di=0.1075, dias_vencimento=15):
     return processar_metricas(df, spot_real)
 
 # ------------------------------------------------------------------
-# CÁLCULO DE MÉTRICAS (PAREDES E FLIP SEPARADOS)
+# CÁLCULO DE MÉTRICAS
 # ------------------------------------------------------------------
 def processar_metricas(df, spot_real):
     df['gex_net'] = df['call_gex'] - df['put_gex']
 
-    # Call Wall: Maior OI de Calls estritamente ACIMA do preço atual
     df_calls_above = df[df['strike'] > spot_real]
     call_wall = df_calls_above.loc[df_calls_above['oi_call'].idxmax()]['strike'] if not df_calls_above.empty else df.loc[df['oi_call'].idxmax()]['strike']
 
-    # Put Wall: Maior OI de Puts estritamente ABAIXO do preço atual
     df_puts_below = df[df['strike'] < spot_real]
     put_wall = df_puts_below.loc[df_puts_below['oi_put'].idxmax()]['strike'] if not df_puts_below.empty else df.loc[df['oi_put'].idxmax()]['strike']
 
-    # Gamma Flip: Ponto de inversão de sinal mais próximo do preço
     df['sign'] = np.sign(df['gex_net'])
     trocas = np.where(np.diff(df['sign']) != 0)[0]
     
@@ -175,7 +173,12 @@ def plotar_grafico(df_gex, metricas, nome_ativo):
 # ------------------------------------------------------------------
 # UI PRINCIPAL
 # ------------------------------------------------------------------
-ativo_selecionado = st.selectbox("Ativo para Análise:", ["WIN (Mini Índice)", "EWZ (iShares MSCI Brazil)"])
+ativo_selecionado = st.radio(
+    "",
+    ["EWZ (EUA / Brasil ETF)", "BOVA11 / WIN (B3)"],
+    index=1,
+    horizontal=True
+)
 
 df_gex, metricas = obter_dados_gex_auto(ativo_selecionado)
 
@@ -185,8 +188,8 @@ with col_graf:
     st.plotly_chart(plotar_grafico(df_gex, metricas, ativo_selecionado), use_container_width=True)
 
 with col_card:
-    unidade = "pts" if "WIN" in ativo_selecionado else "$"
-    fmt = ".0f" if "WIN" in ativo_selecionado else ".2f"
+    unidade = "pts" if "BOVA11" in ativo_selecionado else "$"
+    fmt = ".0f" if "BOVA11" in ativo_selecionado else ".2f"
     
     st.markdown("### Níveis Chave")
     st.metric("Call Wall (TETO / Resistência)", f"{metricas['call_wall']:{fmt}} {unidade}")
